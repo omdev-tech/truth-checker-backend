@@ -5,9 +5,13 @@ import logging
 import os
 from typing import Dict, List
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+
+# Load environment variables from .env file
+load_dotenv()
 
 from ..domain.ports.ai_provider import AIAnalysisResult, AIVerificationResult
 from ..infrastructure.ai.factory import AIProviderFactory

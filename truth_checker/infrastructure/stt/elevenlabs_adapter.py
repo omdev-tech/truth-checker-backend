@@ -47,11 +47,11 @@ class ElevenLabsAdapter(STTProvider):
                     timeout=self._config.timeout,
                     headers={
                         "xi-api-key": self._config.api_key,
-                        "Content-Type": "application/json",
+                        # Don't set Content-Type for multipart requests - httpx will handle this
                     },
                 )
 
-            # Test connection
+            # Test connection using the correct health endpoint
             response = await self._client.get("/health")
             response.raise_for_status()
             self._initialized = True
@@ -80,29 +80,50 @@ class ElevenLabsAdapter(STTProvider):
             raise ValueError(f"Unsupported file format: {extension}")
 
         try:
-            # Upload file for transcription
+            # Upload file for transcription using the correct ElevenLabs API
             with open(file_path, "rb") as f:
                 files = {"file": f}
-                data = {"model": self._config.model}
+                data = {
+                    "model_id": "scribe_v1",  # Use the correct model ID
+                    "timestamps_granularity": "word",
+                    "diarize": False,
+                    "tag_audio_events": False
+                }
+                
                 if language:
-                    data["language"] = language
+                    data["language_code"] = language
 
                 response = await self._client.post(
-                    "/speech-to-text",
+                    "/speech-to-text",  # Correct endpoint
                     files=files,
                     data=data,
                 )
                 response.raise_for_status()
                 result = response.json()
 
-            # Parse response
+            # Parse the response according to the actual ElevenLabs API format
+            # Extract plain text from words array
+            text = result.get("text", "")
+            if not text and result.get("words"):
+                # Reconstruct text from words if main text field is missing
+                text = "".join([word["text"] for word in result["words"]])
+
+            # Calculate duration from last word's end time
+            duration = 0.0
+            if result.get("words"):
+                last_word = result["words"][-1]
+                duration = last_word.get("end", 0.0)
+
             return TranscriptionResult(
-                text=result["text"],
-                confidence=result["confidence"],
-                language=result.get("language", "en"),
+                text=text,
+                confidence=result.get("language_probability", 1.0),  # Use language probability as confidence
+                language=result.get("language_code", language or "en"),
                 start_time=0.0,
-                end_time=result.get("duration", 0.0),
-                metadata=result.get("metadata", {}),
+                end_time=duration,
+                metadata={
+                    "words": result.get("words", []),
+                    "model": "scribe_v1"
+                },
             )
         except Exception as e:
             raise RuntimeError(f"Transcription failed: {e}")

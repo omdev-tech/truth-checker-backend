@@ -65,7 +65,13 @@ class STTProviderFactory:
         if provider_name == "elevenlabs":
             # Automatically load API key from environment if not provided
             if "api_key" not in provider_config:
-                provider_config["api_key"] = os.getenv("ELEVENLABS_API_KEY", "")
+                api_key = os.getenv("ELEVENLABS_API_KEY", "")
+                if not api_key:
+                    raise ValueError(
+                        "ELEVENLABS_API_KEY environment variable is required but not set. "
+                        "Please add your ElevenLabs API key to your .env file."
+                    )
+                provider_config["api_key"] = api_key
             
             instance = provider_class(
                 config=ElevenLabsConfig(**provider_config),

@@ -29,6 +29,7 @@ truth_checker/
    - Python 3.10 or higher
    - pip
    - virtualenv (recommended)
+   - ElevenLabs API key (for speech-to-text functionality)
 
 2. Create and activate virtual environment:
    ```bash
@@ -41,19 +42,30 @@ truth_checker/
    pip install -e ".[dev]"
    ```
 
-4. Run tests:
+4. Environment configuration:
+   ```bash
+   # Copy the environment template
+   cp env.example .env
+   
+   # Edit .env and add your API keys:
+   # - ELEVENLABS_API_KEY: Required for speech-to-text functionality
+   # - OPENAI_API_KEY: Required for AI fact-checking
+   # - ANTHROPIC_API_KEY: Optional, for Claude AI provider
+   ```
+
+5. Run tests:
    ```bash
    pytest
    ```
 
-5. Start development server:
+6. Start development server:
    ```bash
-   uvicorn truth_checker.infrastructure.web.api:app --reload
+   uvicorn truth_checker.api.app:app --reload
    ```
 
 ## Configuration
 
-The project uses environment variables for configuration. Copy `.env.example` to `.env` and adjust values:
+The project uses environment variables for configuration. Copy `env.example` to `.env` and adjust values:
 
 ```env
 # API Settings
@@ -61,12 +73,17 @@ API_HOST=0.0.0.0
 API_PORT=8000
 
 # AI Provider Settings
-OPENAI_API_KEY=your_key_here
-ANTHROPIC_API_KEY=your_key_here
+OPENAI_API_KEY=your_openai_key_here
+ANTHROPIC_API_KEY=your_anthropic_key_here
+
+# Speech-to-Text Provider Settings (REQUIRED)
+ELEVENLABS_API_KEY=your_elevenlabs_api_key_here
 
 # MCP Settings
 WIKIPEDIA_MCP_URL=http://wikipedia.mcp/
 ```
+
+**Note**: The `ELEVENLABS_API_KEY` is required for the speech-to-text functionality. You can get an API key from [ElevenLabs](https://elevenlabs.io/).
 
 ## Development Guidelines
 

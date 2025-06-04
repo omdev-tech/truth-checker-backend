@@ -18,7 +18,8 @@ class ChatGPTConfig(BaseModel):
     model: str = Field(default="gpt-4", description="Model to use (gpt-4 recommended)")
     temperature: float = Field(default=0.1, description="Temperature for responses")
     max_tokens: int = Field(default=1000, description="Maximum tokens per response")
-    timeout: float = Field(default=30.0, description="API timeout in seconds")
+    timeout: float = Field(default=120.0, description="API timeout in seconds")
+    fast_mode: bool = Field(default=False, description="Use faster model for real-time processing")
 
 
 class ChatGPTAdapter(AIProvider):
@@ -137,30 +138,42 @@ class ChatGPTAdapter(AIProvider):
         if not self._client:
             raise RuntimeError("Provider not initialized")
 
-        system_prompt = """
-        Analyze the text and extract ALL factual claims, regardless of whether they appear true or false.
-        Extract any statement that makes a claim about reality, facts, or events that can be verified or disproven.
-        Include controversial, disputed, or obviously false claims - the verification step will determine their accuracy.
-        
-        Respond in JSON format with a list of claims:
-        {
-            "claims": [
-                {
-                    "text": "The actual claim",
-                    "context": "Surrounding context",
-                    "metadata": {"category": "type of claim", "confidence": "extraction confidence"}
-                }
-            ]
-        }
-        
-        Examples of claims to extract:
-        - Scientific facts (true or false): "The Earth is flat", "Vaccines cause autism"
-        - Historical statements: "Napoleon was short", "The moon landing was fake"
-        - Current events: "Company X reported profits", "Country Y invaded Country Z"
-        - Statistical claims: "Crime has increased by 50%", "Population is 100 million"
-        
-        Do NOT filter based on apparent truth value. Extract the claim and let verification determine accuracy.
-        """
+        # Use shorter, faster prompts in fast mode
+        if self._config.fast_mode:
+            system_prompt = """
+            Extract factual claims from text that can be verified. Respond in JSON:
+            {"claims": [{"text": "claim", "context": "context"}]}
+            Focus on concrete, verifiable statements. Skip opinions.
+            """
+            max_tokens = 500
+            model = "gpt-3.5-turbo"  # Faster model for real-time
+        else:
+            system_prompt = """
+            Analyze the text and extract ALL factual claims, regardless of whether they appear true or false.
+            Extract any statement that makes a claim about reality, facts, or events that can be verified or disproven.
+            Include controversial, disputed, or obviously false claims - the verification step will determine their accuracy.
+            
+            Respond in JSON format with a list of claims:
+            {
+                "claims": [
+                    {
+                        "text": "The actual claim",
+                        "context": "Surrounding context",
+                        "metadata": {"category": "type of claim", "confidence": "extraction confidence"}
+                    }
+                ]
+            }
+            
+            Examples of claims to extract:
+            - Scientific facts (true or false): "The Earth is flat", "Vaccines cause autism"
+            - Historical statements: "Napoleon was short", "The moon landing was fake"
+            - Current events: "Company X reported profits", "Country Y invaded Country Z"
+            - Statistical claims: "Crime has increased by 50%", "Population is 100 million"
+            
+            Do NOT filter based on apparent truth value. Extract the claim and let verification determine accuracy.
+            """
+            max_tokens = self._config.max_tokens
+            model = self._config.model
 
         user_prompt = f"Text: {text}"
         if context:
@@ -169,13 +182,13 @@ class ChatGPTAdapter(AIProvider):
         response = await self._client.post(
             "/chat/completions",
             json={
-                "model": self._config.model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": self._config.temperature,
-                "max_tokens": self._config.max_tokens,
+                "max_tokens": max_tokens,
             },
         )
         response.raise_for_status()
