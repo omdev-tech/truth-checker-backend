@@ -100,6 +100,17 @@ class MCPProviderFactory:
             for name in self._provider_registry
         }
 
+    def list_providers(self) -> Dict[str, bool]:
+        """Get dictionary of registered providers and their availability.
+        
+        Returns:
+            Dictionary mapping provider names to their availability status
+        """
+        return {
+            name: bool(self.get_provider(name))
+            for name in self._provider_registry
+        }
+
 
 # Create global factory instance
 mcp_factory = MCPProviderFactory()

@@ -149,29 +149,29 @@ class ChatGPTAdapter(AIProvider):
             model = "gpt-3.5-turbo"  # Faster model for real-time
         else:
             system_prompt = """
-            Analyze the text and extract ALL factual claims, regardless of whether they appear true or false.
-            Extract any statement that makes a claim about reality, facts, or events that can be verified or disproven.
-            Include controversial, disputed, or obviously false claims - the verification step will determine their accuracy.
-            
-            Respond in JSON format with a list of claims:
-            {
-                "claims": [
-                    {
-                        "text": "The actual claim",
-                        "context": "Surrounding context",
-                        "metadata": {"category": "type of claim", "confidence": "extraction confidence"}
-                    }
-                ]
-            }
-            
-            Examples of claims to extract:
-            - Scientific facts (true or false): "The Earth is flat", "Vaccines cause autism"
-            - Historical statements: "Napoleon was short", "The moon landing was fake"
-            - Current events: "Company X reported profits", "Country Y invaded Country Z"
-            - Statistical claims: "Crime has increased by 50%", "Population is 100 million"
-            
-            Do NOT filter based on apparent truth value. Extract the claim and let verification determine accuracy.
-            """
+        Analyze the text and extract ALL factual claims, regardless of whether they appear true or false.
+        Extract any statement that makes a claim about reality, facts, or events that can be verified or disproven.
+        Include controversial, disputed, or obviously false claims - the verification step will determine their accuracy.
+        
+        Respond in JSON format with a list of claims:
+        {
+            "claims": [
+                {
+                    "text": "The actual claim",
+                    "context": "Surrounding context",
+                    "metadata": {"category": "type of claim", "confidence": "extraction confidence"}
+                }
+            ]
+        }
+        
+        Examples of claims to extract:
+        - Scientific facts (true or false): "The Earth is flat", "Vaccines cause autism"
+        - Historical statements: "Napoleon was short", "The moon landing was fake"
+        - Current events: "Company X reported profits", "Country Y invaded Country Z"
+        - Statistical claims: "Crime has increased by 50%", "Population is 100 million"
+        
+        Do NOT filter based on apparent truth value. Extract the claim and let verification determine accuracy.
+        """
             max_tokens = self._config.max_tokens
             model = self._config.model
 

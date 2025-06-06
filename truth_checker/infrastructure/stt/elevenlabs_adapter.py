@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import logging
 from typing import AsyncIterator, Dict, Optional
 
 import httpx
@@ -14,6 +15,8 @@ from ...domain.ports.stt_provider import (
     VideoFormat,
 )
 
+# Set up logger for this module
+logger = logging.getLogger(__name__)
 
 class ElevenLabsConfig(BaseModel):
     """Configuration for ElevenLabs adapter."""
@@ -79,6 +82,13 @@ class ElevenLabsAdapter(STTProvider):
         if extension not in [f.value for f in AudioFormat] + [f.value for f in VideoFormat]:
             raise ValueError(f"Unsupported file format: {extension}")
 
+        # Log file information
+        file_size = os.path.getsize(file_path)
+        logger.info(f"🎵 Processing audio file: {file_path}")
+        logger.info(f"📊 File info: size={file_size} bytes, format={extension}")
+        logger.info(f"🔑 API key configured: {'Yes' if self._config.api_key else 'No'} (length: {len(self._config.api_key)} chars)")
+        logger.info(f"🌐 API base URL: {self._config.base_url}")
+
         try:
             # Upload file for transcription using the correct ElevenLabs API
             with open(file_path, "rb") as f:
@@ -93,13 +103,42 @@ class ElevenLabsAdapter(STTProvider):
                 if language:
                     data["language_code"] = language
 
+                logger.info(f"📡 Making request to ElevenLabs API")
+                logger.info(f"🔧 Request data: {data}")
+                logger.info(f"📁 File size being uploaded: {file_size} bytes")
+
                 response = await self._client.post(
                     "/speech-to-text",  # Correct endpoint
                     files=files,
                     data=data,
                 )
+                
+                logger.info(f"📥 Response status: {response.status_code}")
+                logger.info(f"📋 Response headers: {dict(response.headers)}")
+                
+                # Log response content for debugging (but handle errors gracefully)
+                try:
+                    if response.status_code != 200:
+                        response_text = response.text
+                        logger.error(f"❌ Error response body: {response_text}")
+                        logger.error(f"🔍 Request URL: {response.url}")
+                        
+                        # Try to parse error details from ElevenLabs
+                        try:
+                            error_json = response.json()
+                            logger.error(f"🔍 Error JSON: {error_json}")
+                        except:
+                            logger.error(f"📄 Raw error text: {response_text}")
+                    
+                except Exception as e:
+                    logger.error(f"⚠️ Could not log response details: {e}")
+                
                 response.raise_for_status()
                 result = response.json()
+                
+                logger.info(f"✅ Transcription successful")
+                logger.info(f"📝 Result keys: {list(result.keys())}")
+                logger.info(f"📊 Text length: {len(result.get('text', ''))} characters")
 
             # Parse the response according to the actual ElevenLabs API format
             # Extract plain text from words array
@@ -114,6 +153,8 @@ class ElevenLabsAdapter(STTProvider):
                 last_word = result["words"][-1]
                 duration = last_word.get("end", 0.0)
 
+            logger.info(f"🏁 Final transcription: {len(text)} chars, {duration}s duration")
+
             return TranscriptionResult(
                 text=text,
                 confidence=result.get("language_probability", 1.0),  # Use language probability as confidence
@@ -125,7 +166,17 @@ class ElevenLabsAdapter(STTProvider):
                     "model": "scribe_v1"
                 },
             )
+        except httpx.HTTPStatusError as e:
+            logger.error(f"💥 HTTP Status Error: {e.response.status_code}")
+            logger.error(f"🔍 Error response: {e.response.text}")
+            logger.error(f"🌐 Request URL: {e.request.url}")
+            logger.error(f"📋 Request headers: {dict(e.request.headers)}")
+            raise RuntimeError(f"Transcription failed: HTTP {e.response.status_code}: {e.response.text}")
+        except httpx.RequestError as e:
+            logger.error(f"💥 Request Error: {e}")
+            raise RuntimeError(f"Transcription failed: Request error: {e}")
         except Exception as e:
+            logger.error(f"💥 Unexpected error: {type(e).__name__}: {e}")
             raise RuntimeError(f"Transcription failed: {e}")
 
     async def transcribe_stream(

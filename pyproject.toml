@@ -24,6 +24,7 @@ dependencies = [
     "structlog>=23.2.0",
     "wikipedia-api>=0.6.0",  # For Wikipedia access
     "cachetools>=5.3.0",    # For response caching
+    "yt-dlp>=2025.5.22",    # For YouTube and stream audio extraction
 ]
 
 [project.optional-dependencies]

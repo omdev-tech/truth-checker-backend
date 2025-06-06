@@ -122,11 +122,21 @@ app.router.lifespan_context = lifespan
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """Check service health and available providers."""
+    try:
+        ai_providers = list(app.ai_factory.list_providers().keys())
+    except Exception:
+        ai_providers = []
+    
+    try:
+        mcp_providers = list(app.mcp_factory.list_providers().keys())
+    except Exception:
+        mcp_providers = []
+    
     return HealthResponse(
         status="healthy",
         version="0.1.0",
-        ai_providers=list(app.ai_factory.list_providers().keys()),
-        mcp_providers=list(app.mcp_factory.list_providers().keys()),
+        ai_providers=ai_providers,
+        mcp_providers=mcp_providers,
     )
 
 

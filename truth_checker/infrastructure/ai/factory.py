@@ -82,6 +82,17 @@ class AIProviderFactory:
             for name in self._providers
         }
 
+    def list_providers(self) -> Dict[str, bool]:
+        """Get dictionary of registered providers and their availability.
+        
+        Returns:
+            Dictionary mapping provider names to their availability status
+        """
+        return {
+            name: name in self._instances
+            for name in self._providers
+        }
+
     async def shutdown(self) -> None:
         """Shutdown all provider instances."""
         for provider in self._instances.values():
