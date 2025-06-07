@@ -135,7 +135,7 @@ class ElevenLabsAdapter(STTProvider):
                 
                 response.raise_for_status()
                 result = response.json()
-                
+
                 logger.info(f"✅ Transcription successful")
                 logger.info(f"📝 Result keys: {list(result.keys())}")
                 logger.info(f"📊 Text length: {len(result.get('text', ''))} characters")

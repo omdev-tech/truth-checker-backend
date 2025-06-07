@@ -552,7 +552,6 @@ async def transcribe_chunk(
     except Exception as e:
         logger.error(f"Chunk processing error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-        
     finally:
         # Clean up
         if temp_file and os.path.exists(temp_file):
