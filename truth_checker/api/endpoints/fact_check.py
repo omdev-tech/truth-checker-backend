@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from ...domain.models.claim import Claim
 from ...domain.models.verification import VerificationResult, ConfidenceLevel
 from ...infrastructure.ai.factory import AIProviderFactory
-from ...infrastructure.mcp.factory import MCPProviderFactory
+from ...infrastructure.mcp.factory import MCPProviderFactory, mcp_factory
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -68,7 +68,6 @@ async def check_text(request: TextCheckRequest) -> TextCheckResponse:
         
         # Get or create MCP provider for fact verification
         logger.info("Getting MCP provider...")
-        mcp_factory = MCPProviderFactory()
         mcp_provider = mcp_factory.get_provider("wikipedia")
         if mcp_provider is None:
             logger.info("MCP provider not found, creating new one...")
@@ -168,7 +167,6 @@ async def websocket_endpoint(websocket: WebSocket):
         if ai_provider is None:
             ai_provider = await ai_factory.create_provider("chatgpt")
         
-        mcp_factory = MCPProviderFactory()
         mcp_provider = mcp_factory.get_provider("wikipedia")
         if mcp_provider is None:
             mcp_provider = await mcp_factory.create_provider("wikipedia")

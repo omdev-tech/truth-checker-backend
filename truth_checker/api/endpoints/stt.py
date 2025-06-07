@@ -1,26 +1,38 @@
-"""STT endpoints for file upload and WebSocket streaming."""
+"""Speech-to-text API endpoints."""
 
 import asyncio
+import logging
 import os
 import tempfile
-import subprocess
-import logging
-from typing import AsyncIterator, Optional
-from urllib.parse import urlparse, parse_qs
+from datetime import datetime
+from typing import Dict, List, Optional
 
 from fastapi import (
     APIRouter,
+    Depends,
     File,
+    Form,
     HTTPException,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from ...domain.ports.stt_provider import AudioFormat, TranscriptionResult, VideoFormat
-from ...infrastructure.stt.factory import STTProviderFactory
+from ...domain.models.claim import Claim
+from ...domain.models.verification import VerificationResult, VerificationStatus, ConfidenceLevel
+from ...domain.ports.live_stream_detector import LiveBroadcastStatus, DetectionMethod
+from ...domain.ports.stt_provider import TranscriptionResult, AudioFormat, VideoFormat
+from ...domain.services.fact_checking_service import FactCheckingService
+from ...domain.services.stt_service import STTService
+from ...domain.services.stream_analysis_service import StreamAnalysisService
+from ...infrastructure.dependencies import (
+    get_fact_checking_service,
+    get_stt_service,
+    get_stream_analysis_service
+)
 from ...infrastructure.ai.factory import AIProviderFactory
+from ...infrastructure.mcp.factory import MCPProviderFactory, mcp_factory
 
 router = APIRouter(prefix="/stt", tags=["stt"])
 
@@ -28,11 +40,31 @@ router = APIRouter(prefix="/stt", tags=["stt"])
 logger = logging.getLogger(__name__)
 
 
+def float_to_confidence_level(confidence: float) -> ConfidenceLevel:
+    """Convert float confidence to ConfidenceLevel enum."""
+    if confidence >= 0.9:
+        return ConfidenceLevel.HIGH
+    elif confidence >= 0.7:
+        return ConfidenceLevel.MEDIUM
+    elif confidence >= 0.5:
+        return ConfidenceLevel.LOW
+    else:
+        return ConfidenceLevel.INSUFFICIENT
+
+
+class HealthStatus(BaseModel):
+    """Health check response model."""
+    status: str
+    timestamp: str
+    providers: Dict[str, str]
+
+
 class TranscriptionRequest(BaseModel):
     """Request model for transcription."""
 
     provider: str = "elevenlabs"
     language: Optional[str] = None
+    fast_mode: bool = True
 
 
 class StreamProcessingRequest(BaseModel):
@@ -60,316 +92,471 @@ class TranscriptionResponse(BaseModel):
 class ChunkProcessingRequest(BaseModel):
     """Request model for chunk processing (transcription + fact-checking)."""
 
+    chunk_index: int
+    total_chunks: int
+    start_time: float
+    end_time: float
     provider: str = "elevenlabs"
     language: Optional[str] = None
     fast_mode: bool = True  # Use fast processing for real-time feedback
-    start_time: Optional[float] = None
-    end_time: Optional[float] = None
+
+
+class StreamFactCheckResponse(BaseModel):
+    """Response model for stream fact-checking (same as TextCheckResponse)."""
+    
+    claims: List[Claim] = Field(..., description="Extracted claims")
+    results: List[VerificationResult] = Field(..., description="Verification results")
 
 
 class ChunkProcessingResponse(BaseModel):
     """Response model for chunk processing."""
 
+    chunk_index: int
     transcription: TranscriptionResponse
-    fact_check: dict
+    fact_check: dict  # Keep as dict to match frontend expectations
     processing_time: float
-    chunk_info: dict
+    start_time: float
+    end_time: float
+    duration: float
 
 
-@router.post("/transcribe", response_model=TranscriptionResponse)
+class LiveStatusRequest(BaseModel):
+    """Request model for live status detection."""
+    url: str
+    stream_type: str = "youtube"
+    manual_live_override: bool = False
+
+
+class LiveStatusResponse(BaseModel):
+    """Response model for live status detection."""
+    is_live: bool
+    live_broadcast_content: str  # "live", "upcoming", "none"
+    method: str  # Detection method used
+    video_id: Optional[str] = None
+    title: Optional[str] = None
+    concurrent_viewers: Optional[int] = None
+    error: Optional[str] = None
+
+
+@router.get("/health", response_model=HealthStatus)
+async def health_check(
+    stt_service: STTService = Depends(get_stt_service)
+):
+    """Health check endpoint."""
+    # Check STT provider
+    try:
+        provider_status = "available"
+    except Exception as e:
+        logger.error(f"STT service error: {e}")
+        provider_status = "unavailable"
+    
+    return HealthStatus(
+        status="healthy",
+        timestamp=datetime.now().isoformat(),
+        providers={
+            "stt": provider_status,
+            "fact_checker": "available",
+            "stream_analysis": "available"
+        }
+    )
+
+
+@router.post("/transcribe")
 async def transcribe_file(
     file: UploadFile = File(...),
-    request: TranscriptionRequest = TranscriptionRequest(),
-) -> TranscriptionResponse:
-    """Transcribe an audio/video file.
-
-    Args:
-        file: Audio/video file to transcribe
-        request: Transcription request parameters
-
-    Returns:
-        Transcription result
-    """
-    # Verify file format
-    extension = os.path.splitext(file.filename)[1].lower()[1:]
-    supported_formats = [f.value for f in AudioFormat] + [f.value for f in VideoFormat]
-    if extension not in supported_formats:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format. Supported formats: {', '.join(supported_formats)}",
-        )
-
-    # Save file temporarily
-    with tempfile.NamedTemporaryFile(suffix=f".{extension}", delete=False) as temp_file:
-        try:
-            # Write uploaded file to temp file
-            content = await file.read()
-            temp_file.write(content)
-            temp_file.flush()
-
-            # Get STT provider
-            factory = STTProviderFactory()
-            try:
-                provider = await factory.create_provider(request.provider)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-
-            # Transcribe file
-            try:
-                result = await provider.transcribe_file(
-                    temp_file.name,
-                    language=request.language,
-                )
-                return TranscriptionResponse(
-                    text=result.text,
-                    confidence=result.confidence,
-                    language=result.language,
-                    duration=result.end_time - result.start_time,
-                    metadata=result.metadata,
-                )
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-            finally:
-                await factory.shutdown_provider(request.provider)
-
-        finally:
-            # Clean up temp file
-            os.unlink(temp_file.name)
-
-
-async def process_audio_stream(
-    websocket: WebSocket,
-    chunk_size: int = 4096,
-    provider_name: str = "elevenlabs",
-    language: Optional[str] = None,
-) -> AsyncIterator[TranscriptionResult]:
-    """Process audio stream from WebSocket.
-
-    Args:
-        websocket: WebSocket connection
-        chunk_size: Size of audio chunks to process
-        provider_name: Name of STT provider to use
-        language: Optional language code
-
-    Yields:
-        Transcription results
-    """
-    # Initialize STT provider
-    factory = STTProviderFactory()
-    provider = await factory.create_provider(provider_name)
-
-    try:
-        # Create async iterator for audio chunks
-        async def audio_stream() -> AsyncIterator[bytes]:
-            while True:
-                try:
-                    chunk = await websocket.receive_bytes()
-                    yield chunk
-                except WebSocketDisconnect:
-                    break
-
-        # Process audio stream
-        async for result in provider.transcribe_stream(
-            audio_stream(),
-            chunk_size=chunk_size,
-            language=language,
-        ):
-            yield result
-
-    finally:
-        await factory.shutdown_provider(provider_name)
-
-
-@router.websocket("/stream")
-async def stream_audio(
-    websocket: WebSocket,
-    provider: str = "elevenlabs",
-    language: Optional[str] = None,
+    provider: str = Form("elevenlabs"),
+    language: Optional[str] = Form(None),
+    fast_mode: bool = Form(True),
+    stt_service: STTService = Depends(get_stt_service)
 ):
-    """WebSocket endpoint for real-time audio streaming.
-
-    Args:
-        websocket: WebSocket connection
-        provider: STT provider to use
-        language: Optional language code
-    """
-    await websocket.accept()
-
+    """Transcribe uploaded audio/video file."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    
+    # Save uploaded file temporarily
+    temp_file = None
     try:
-        # Process audio stream and send results
-        async for result in process_audio_stream(
-            websocket,
-            provider_name=provider,
+        import tempfile
+        import os
+        
+        # Create temporary file with appropriate extension
+        file_ext = os.path.splitext(file.filename)[1] if file.filename else '.tmp'
+        with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as f:
+            temp_file = f.name
+            content = await file.read()
+            f.write(content)
+        
+        # Determine format
+        if file.content_type and file.content_type.startswith('video/'):
+            format_type = VideoFormat.MP4  # Default video format
+        else:
+            format_type = AudioFormat.WAV  # Default audio format
+        
+        # Process file
+        result = await stt_service.transcribe_file(
+            temp_file,
+            format_type,
             language=language,
-        ):
-            await websocket.send_json(
-                {
-                    "text": result.text,
-                    "confidence": result.confidence,
-                    "language": result.language,
-                    "start_time": result.start_time,
-                    "end_time": result.end_time,
-                    "metadata": result.metadata,
-                }
-            )
-
-    except WebSocketDisconnect:
-        pass  # Client disconnected
+            fast_mode=fast_mode
+        )
+        
+        return {
+            "transcription": result.text,
+            "confidence": result.confidence,
+            "processing_time": result.processing_time,
+            "language": result.language,
+            "provider": provider
+        }
+        
     except Exception as e:
-        await websocket.send_json({"error": str(e)})
+        logger.error(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
     finally:
-        await websocket.close()
+        # Clean up temporary file
+        if temp_file and os.path.exists(temp_file):
+            os.unlink(temp_file)
 
 
-@router.post("/transcribe-chunk", response_model=ChunkProcessingResponse)
-async def transcribe_and_fact_check_chunk(
+@router.post("/process-chunk", response_model=ChunkProcessingResponse)
+async def process_chunk(
+    request: ChunkProcessingRequest,
     file: UploadFile = File(...),
-    request: ChunkProcessingRequest = ChunkProcessingRequest(),
-) -> ChunkProcessingResponse:
-    """Transcribe and fact-check an audio/video chunk for real-time processing.
-
-    Args:
-        file: Audio/video file chunk to process
-        request: Chunk processing request parameters
-
-    Returns:
-        Combined transcription and fact-check results
-    """
+    stt_service: STTService = Depends(get_stt_service),
+    fact_checker: FactCheckingService = Depends(get_fact_checking_service)
+):
+    """Process a single chunk with transcription and fact-checking."""
     import time
     start_time = time.time()
     
-    # Verify file format
-    extension = os.path.splitext(file.filename)[1].lower()[1:]
-    supported_formats = [f.value for f in AudioFormat] + [f.value for f in VideoFormat]
-    if extension not in supported_formats:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format. Supported formats: {', '.join(supported_formats)}",
-        )
-
-    # Save file temporarily
-    with tempfile.NamedTemporaryFile(suffix=f".{extension}", delete=False) as temp_file:
-        try:
-            # Write uploaded file to temp file
+    temp_file = None
+    
+    try:
+        # Save uploaded chunk temporarily
+        import tempfile
+        import os
+        
+        file_ext = os.path.splitext(file.filename)[1] if file.filename else '.wav'
+        with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as f:
+            temp_file = f.name
             content = await file.read()
-            temp_file.write(content)
-            temp_file.flush()
+            f.write(content)
+        
+        # Determine format
+        if file.content_type and file.content_type.startswith('video/'):
+            format_type = VideoFormat.MP4
+        else:
+            format_type = AudioFormat.WAV
+        
+        print(f"📝 Processing chunk {request.chunk_index + 1}/{request.total_chunks}")
+        print(f"⏱️ Time range: {request.start_time:.1f}s - {request.end_time:.1f}s")
+        
+        # Transcribe chunk
+        transcription_result = await stt_service.transcribe_file(
+            temp_file,
+            format_type,
+            language=request.language,
+            fast_mode=request.fast_mode
+        )
+        
+        print(f"📝 Transcription: {transcription_result.text[:100]}...")
+        
+        # Fact-check transcription
+        if transcription_result.text.strip():
+            fact_check_result = await fact_checker.fact_check(transcription_result.text)
+            print(f"✅ Fact-check completed: {fact_check_result.overall_assessment}")
+        else:
+            # Empty transcription
+            fact_check_result = type('obj', (object,), {
+                'overall_assessment': 'No content to fact-check',
+                'claims': [],
+                'sources': [],
+                'confidence_score': 0.0
+            })()
+            print("⚠️ No transcribable content in this chunk")
+        
+        processing_time = time.time() - start_time
+        
+        return ChunkProcessingResponse(
+            chunk_index=request.chunk_index,
+            transcription=TranscriptionResponse(
+                text=transcription_result.text,
+                confidence=transcription_result.confidence,
+                language=transcription_result.language,
+                duration=transcription_result.end_time - transcription_result.start_time,
+                metadata=transcription_result.metadata,
+            ),
+            fact_check=fact_check_result,
+            processing_time=processing_time,
+            start_time=request.start_time,
+            end_time=request.end_time,
+            duration=request.end_time - request.start_time
+        )
+        
+    except Exception as e:
+        logger.error(f"Chunk processing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    finally:
+        # Clean up
+        if temp_file and os.path.exists(temp_file):
+            os.unlink(temp_file)
 
-            # Get STT provider
-            stt_factory = STTProviderFactory()
-            ai_factory = AIProviderFactory()
-            stt_provider = None
-            ai_provider = None
+
+@router.post("/transcribe-chunk", response_model=ChunkProcessingResponse)
+async def transcribe_chunk(
+    file: UploadFile = File(...),
+    provider: str = Form("elevenlabs"),
+    language: Optional[str] = Form(None),
+    fast_mode: bool = Form(True),
+    start_time: float = Form(0.0),
+    end_time: float = Form(0.0),
+    chunk_index: int = Form(0),
+    total_chunks: int = Form(1),
+    stt_service: STTService = Depends(get_stt_service)
+):
+    """Alias endpoint for transcribe-chunk (compatibility with frontend API).
+    
+    This endpoint processes a chunk with transcription and fact-checking,
+    using the same robust logic as stream processing.
+    """
+    import time
+    start_time_processing = time.time()
+    
+    temp_file = None
+    
+    try:
+        # Save uploaded chunk temporarily
+        import tempfile
+        import os
+        
+        file_ext = os.path.splitext(file.filename)[1] if file.filename else '.wav'
+        with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as f:
+            temp_file = f.name
+            content = await file.read()
+            f.write(content)
+        
+        # Determine format
+        if file.content_type and file.content_type.startswith('video/'):
+            format_type = VideoFormat.MP4
+        else:
+            format_type = AudioFormat.WAV
+        
+        print(f"📝 Processing chunk {chunk_index + 1}/{total_chunks}")
+        print(f"⏱️ Time range: {start_time:.1f}s - {end_time:.1f}s")
+        
+        # Transcribe chunk
+        transcription_result = await stt_service.transcribe_file(
+            temp_file,
+            format_type,
+            language=language,
+            fast_mode=fast_mode
+        )
+        
+        print(f"📝 Transcription: {transcription_result.text[:100]}...")
+        
+        # Fact-check transcription if there's content (using same logic as stream processing)
+        if transcription_result.text.strip():
+            print("🔍 Starting fact-check...")
             
             try:
-                stt_provider = await stt_factory.create_provider(request.provider)
+                # Use the same approach as the working /fact-check/text endpoint
+                logger.info("Getting AI provider...")
+                ai_factory = AIProviderFactory()
+                ai_provider = ai_factory.get_provider("chatgpt")
+                if ai_provider is None:
+                    logger.info("AI provider not found, creating new one...")
+                    ai_provider = await ai_factory.create_provider("chatgpt")
+                logger.info("AI provider ready")
                 
-                # Create AI provider with fast mode if requested
-                ai_config = {"fast_mode": request.fast_mode} if request.fast_mode else {}
-                ai_provider = await ai_factory.create_provider("chatgpt", **ai_config)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-
-            # Transcribe file
-            try:
-                transcription_result = await stt_provider.transcribe_file(
-                    temp_file.name,
-                    language=request.language,
-                )
+                # Get or create MCP provider for fact verification
+                logger.info("Getting MCP provider...")
+                mcp_provider = mcp_factory.get_provider("wikipedia")
+                if mcp_provider is None:
+                    logger.info("MCP provider not found, creating new one...")
+                    mcp_provider = await mcp_factory.create_provider("wikipedia")
+                logger.info("MCP provider ready")
                 
-                transcription_response = TranscriptionResponse(
-                    text=transcription_result.text,
-                    confidence=transcription_result.confidence,
-                    language=transcription_result.language,
-                    duration=transcription_result.end_time - transcription_result.start_time,
-                    metadata=transcription_result.metadata,
-                )
+                # Set language if specified
+                if language and language != "en":
+                    logger.info(f"Setting language to {language}")
+                    await mcp_provider.set_language(language)
                 
-                # Fact-check the transcription if there's text
-                fact_check_result = {"status": "no_text", "claims": [], "overall_confidence": 0.0}
+                # Extract claims from text
+                logger.info("Extracting claims from text...")
+                claims = await ai_provider.analyze_text(transcription_result.text, None)
+                logger.info(f"Found {len(claims)} claims")
                 
-                if transcription_result.text and len(transcription_result.text.strip()) > 10:
-                    try:
-                        # Extract claims from transcription
-                        claims = await ai_provider.analyze_text(transcription_result.text)
-                        
-                        if claims:
-                            # Verify claims (simplified for fast processing)
-                            verified_claims = []
-                            total_confidence = 0.0
-                            
-                            for claim in claims[:3]:  # Limit to first 3 claims for speed
-                                verification = await ai_provider.verify_claim(claim)
-                                verified_claims.append({
-                                    "text": claim.text,
-                                    "status": verification.status.value if verification.status else "unknown",
-                                    "confidence": verification.confidence.value if verification.confidence else "low",
-                                    "explanation": verification.explanation
-                                })
-                                
-                                # Calculate confidence score
-                                confidence_map = {"high": 1.0, "medium": 0.6, "low": 0.3, "insufficient": 0.1}
-                                total_confidence += confidence_map.get(verification.confidence.value if verification.confidence else "low", 0.3)
-                            
-                            avg_confidence = total_confidence / len(verified_claims) if verified_claims else 0.0
-                            
-                            # Determine overall status
-                            statuses = [claim["status"] for claim in verified_claims]
-                            if any(status in ["false", "misleading"] for status in statuses):
-                                overall_status = "false"
-                            elif any(status == "disputed" for status in statuses):
-                                overall_status = "uncertain"
-                            elif any(status in ["true", "partially_true"] for status in statuses):
-                                overall_status = "true"
-                            else:
-                                overall_status = "not_checkable"
-                            
-                            fact_check_result = {
-                                "status": overall_status,
-                                "claims": verified_claims,
-                                "overall_confidence": avg_confidence,
-                                "total_claims": len(claims),
-                                "processed_claims": len(verified_claims)
-                            }
-                        else:
-                            fact_check_result = {"status": "not_checkable", "claims": [], "overall_confidence": 0.0}
-                            
-                    except Exception as e:
-                        # Don't fail the entire request if fact-checking fails
-                        fact_check_result = {
-                            "status": "error", 
-                            "error": str(e),
-                            "claims": [], 
-                            "overall_confidence": 0.0
-                        }
+                # Verify each claim (same logic as working endpoint)
+                results = []
+                for i, claim in enumerate(claims):
+                    logger.info(f"Verifying claim {i+1}/{len(claims)}: {claim.text}")
+                    
+                    # Get AI verification
+                    logger.info("Getting AI verification...")
+                    ai_result = await ai_provider.verify_claim(claim, None)
+                    logger.info(f"AI verification complete: {ai_result.status}")
+                    
+                    # Get MCP validation
+                    logger.info("Getting MCP validation...")
+                    mcp_result = await mcp_provider.validate_fact(claim.text)
+                    logger.info(f"MCP validation complete: {mcp_result.is_valid}")
+                    
+                    # Combine results (prefer MCP when available)
+                    if mcp_result.is_valid:
+                        # Create new result with combined data
+                        combined_sources = ai_result.sources + mcp_result.source_urls
+                        final_result = VerificationResult(
+                            claim_text=ai_result.claim_text,
+                            status=ai_result.status,
+                            confidence=float_to_confidence_level(mcp_result.confidence),
+                            explanation=ai_result.explanation,
+                            sources=combined_sources,
+                            timestamp=ai_result.timestamp,
+                            metadata=ai_result.metadata
+                        )
+                        results.append(final_result)
+                    else:
+                        results.append(ai_result)
                 
-                processing_time = time.time() - start_time
+                # Convert to frontend format
+                claims_data = []
+                total_confidence = 0.0
+                status_counts = {
+                    'true': 0, 'false': 0, 'uncertain': 0, 'unverifiable': 0,
+                    'partially_true': 0, 'disputed': 0, 'misleading': 0
+                }
                 
-                return ChunkProcessingResponse(
-                    transcription=transcription_response,
-                    fact_check=fact_check_result,
-                    processing_time=processing_time,
-                    chunk_info={
-                        "start_time": request.start_time,
-                        "end_time": request.end_time,
-                        "fast_mode": request.fast_mode,
-                        "provider": request.provider
-                    }
-                )
+                for i, (claim, result) in enumerate(zip(claims, results)):
+                    # Convert VerificationStatus to string
+                    status_str = result.status.value.lower() if hasattr(result.status, 'value') else str(result.status).lower()
+                    if status_str == 'unverifiable':
+                        status_str = 'uncertain'
+                    
+                    # Convert ConfidenceLevel to percentage string
+                    confidence_str = result.confidence.value.lower() if hasattr(result.confidence, 'value') else str(result.confidence).lower()
+                    
+                    claims_data.append({
+                        'text': claim.text,
+                        'status': status_str,
+                        'confidence': confidence_str,
+                        'explanation': result.explanation or f"This claim was assessed as {status_str}"
+                    })
+                    
+                    # Count for overall status (handle all possible status types)
+                    if status_str in status_counts:
+                        status_counts[status_str] += 1
+                    else:
+                        # Handle any unknown status types as uncertain
+                        status_counts['uncertain'] += 1
+                    
+                    # Convert confidence to float for averaging
+                    confidence_float = 0.5  # default
+                    if confidence_str == 'high':
+                        confidence_float = 0.9
+                    elif confidence_str == 'medium':
+                        confidence_float = 0.7
+                    elif confidence_str == 'low':
+                        confidence_float = 0.5
+                    else:
+                        confidence_float = 0.3
+                    
+                    total_confidence += confidence_float
+                
+                # Calculate overall confidence and status
+                overall_confidence = total_confidence / len(claims) if len(claims) > 0 else 0.0
+                
+                # Determine overall status using weighted scoring system
+                total_claims = len(claims)
+                if total_claims == 0:
+                    overall_status = 'no_text'
+                else:
+                    # Calculate weighted scores for different status types
+                    positive_score = status_counts.get('true', 0) * 1.0 + status_counts.get('partially_true', 0) * 0.7
+                    negative_score = status_counts.get('false', 0) * 1.0 + status_counts.get('misleading', 0) * 0.8
+                    neutral_score = (
+                        status_counts.get('uncertain', 0) * 0.3 + 
+                        status_counts.get('unverifiable', 0) * 0.3 + 
+                        status_counts.get('disputed', 0) * 0.5
+                    )
+                    
+                    # Determine overall status based on weighted scores
+                    if positive_score > negative_score and positive_score > neutral_score:
+                        overall_status = 'true'
+                    elif negative_score > positive_score and negative_score > neutral_score:
+                        overall_status = 'false'
+                    elif total_claims == status_counts.get('uncertain', 0) + status_counts.get('unverifiable', 0):
+                        overall_status = 'not_checkable'
+                    else:
+                        overall_status = 'uncertain'
+                
+                fact_check_response = {
+                    'status': overall_status,
+                    'claims': claims_data,
+                    'overall_confidence': overall_confidence,
+                    'total_claims': len(claims),
+                    'processed_claims': len(claims)
+                }
+                
+                print(f"✅ Fact-check completed: {len(claims)} claims, {len(results)} results")
+                print(f"📊 Overall: {overall_status} ({overall_confidence:.1%} confidence)")
                 
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-            finally:
-                # Clean up providers
-                if stt_provider:
-                    await stt_factory.shutdown_provider(request.provider)
-                if ai_provider:
-                    await ai_factory.shutdown()
-
-        finally:
-            # Clean up temp file
-            if os.path.exists(temp_file.name):
-                os.unlink(temp_file.name) 
+                logger.error(f"❌ Error in chunk fact-checking: {type(e).__name__}: {str(e)}", exc_info=True)
+                # Fallback response on error
+                fact_check_response = {
+                    'status': 'error',
+                    'claims': [{
+                        'text': transcription_result.text[:100] + ('...' if len(transcription_result.text) > 100 else ''),
+                        'status': 'error',
+                        'confidence': 'insufficient',
+                        'explanation': f"Error occurred during fact-checking: {str(e)}"
+                    }],
+                    'overall_confidence': 0.0,
+                    'total_claims': 1,
+                    'processed_claims': 0,
+                    'error': str(e)
+                }
+                print(f"⚠️ Fact-check failed, using fallback response")
+        else:
+            # Empty transcription
+            fact_check_response = {
+                'status': 'no_text',
+                'claims': [],
+                'overall_confidence': 0.0,
+                'total_claims': 0,
+                'processed_claims': 0
+            }
+            print("⚠️ No transcribable content in this chunk")
+        
+        processing_time = time.time() - start_time_processing
+        
+        print(f"✅ Chunk processed in {processing_time:.2f}s")
+        
+        return ChunkProcessingResponse(
+            chunk_index=chunk_index,
+            transcription=TranscriptionResponse(
+                text=transcription_result.text,
+                confidence=transcription_result.confidence,
+                language=transcription_result.language,
+                duration=transcription_result.end_time - transcription_result.start_time,
+                metadata=transcription_result.metadata,
+            ),
+            fact_check=fact_check_response,
+            processing_time=processing_time,
+            start_time=start_time,
+            end_time=end_time,
+            duration=end_time - start_time
+        )
+        
+    except Exception as e:
+        logger.error(f"Chunk processing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    finally:
+        # Clean up
+        if temp_file and os.path.exists(temp_file):
+            os.unlink(temp_file)
 
 
 def extract_youtube_video_id(url: str) -> Optional[str]:
@@ -397,13 +584,13 @@ def extract_twitch_channel(url: str) -> Optional[str]:
 
 async def get_video_duration(url: str, stream_type: str) -> float:
     """Get the actual duration of a video using yt-dlp.
-    
+
     Args:
         url: Video URL
         stream_type: Type of stream ('youtube', 'twitch', 'direct-url')
-        
+
     Returns:
-        Duration in seconds
+        Duration in seconds (returns -1 for live streams)
     """
     try:
         if stream_type == 'youtube':
@@ -431,9 +618,20 @@ async def get_video_duration(url: str, stream_type: str) -> float:
                 logger.warning(f"⚠️ Could not get video duration: {stderr.decode()}")
                 return 3600.0  # Default to 1 hour if unknown
             
-            duration = float(stdout.decode().strip())
-            logger.info(f"🎬 Video duration: {duration}s ({duration/60:.1f} minutes)")
-            return duration
+            duration_str = stdout.decode().strip()
+            
+            # Handle live streams that return "NA" or similar
+            if duration_str.upper() in ['NA', 'N/A', '', 'NONE', 'NULL']:
+                logger.info(f"🔴 Live stream detected via duration: {duration_str}")
+                return -1.0  # Special value for live streams
+            
+            try:
+                duration = float(duration_str)
+                logger.info(f"🎬 Video duration: {duration}s ({duration/60:.1f} minutes)")
+                return duration
+            except ValueError:
+                logger.warning(f"⚠️ Could not parse duration: '{duration_str}' - treating as live stream")
+                return -1.0  # Treat unparseable duration as live stream
             
         else:
             # For other types, assume long duration
@@ -451,13 +649,13 @@ async def download_stream_audio(
     duration: float = 300.0
 ) -> str:
     """Download audio from stream URL using yt-dlp and ffmpeg.
-    
+
     Args:
         url: Stream URL
         stream_type: Type of stream ('youtube', 'twitch', 'direct-url')
         start_time: Start time in seconds
         duration: Duration in seconds
-        
+
     Returns:
         Path to downloaded audio file
     """
@@ -476,16 +674,22 @@ async def download_stream_audio(
             # Get actual video duration first
             video_duration = await get_video_duration(url, stream_type)
             
-            # Check if the requested segment is beyond video duration
-            if start_time >= video_duration:
-                logger.warning(f"⚠️ Segment start ({start_time}s) is beyond video duration ({video_duration}s)")
-                raise ValueError(f"Segment beyond video duration: {start_time}s >= {video_duration}s")
-            
-            # Adjust duration if segment extends beyond video end
-            if start_time + duration > video_duration:
-                adjusted_duration = video_duration - start_time
-                logger.info(f"📐 Adjusting segment duration from {duration}s to {adjusted_duration}s")
-                duration = adjusted_duration
+            # Only check duration limits for non-live streams (video_duration > 0)
+            if video_duration > 0:
+                # Check if the requested segment is beyond video duration
+                if start_time >= video_duration:
+                    logger.warning(f"⚠️ Segment start ({start_time}s) is beyond video duration ({video_duration}s)")
+                    raise ValueError(f"Segment beyond video duration: {start_time}s >= {video_duration}s")
+                
+                # Adjust duration if segment extends beyond video end
+                if start_time + duration > video_duration:
+                    adjusted_duration = video_duration - start_time
+                    logger.info(f"📐 Adjusting segment duration from {duration}s to {adjusted_duration}s")
+                    duration = adjusted_duration
+            else:
+                # Live stream detected (video_duration == -1.0)
+                logger.info(f"🔴 Live stream detected - skipping duration validation")
+                logger.info(f"🎵 Processing live audio: {duration}s from current position")
             
             # Use yt-dlp to extract audio stream URL
             cmd = [
@@ -583,9 +787,10 @@ async def download_stream_audio(
 @router.post("/process-stream", response_model=ChunkProcessingResponse)
 async def process_stream_segment(
     request: StreamProcessingRequest,
+    stt_service: STTService = Depends(get_stt_service)
 ) -> ChunkProcessingResponse:
     """Process a segment from a stream URL (YouTube, Twitch, etc.).
-    
+
     Args:
         request: Stream processing request with URL and parameters
         
@@ -619,6 +824,7 @@ async def process_stream_segment(
             if "beyond video duration" in str(e):
                 logger.info(f"⏭️ Segment beyond video duration - returning empty result")
                 return ChunkProcessingResponse(
+                    chunk_index=0,
                     transcription=TranscriptionResponse(
                         text="",
                         confidence=0.0,
@@ -626,17 +832,11 @@ async def process_stream_segment(
                         duration=0.0,
                         metadata={"skip_reason": "beyond_video_duration"}
                     ),
-                    fact_check={"status": "no_content", "claims": [], "overall_confidence": 0.0},
+                    fact_check={},
                     processing_time=time.time() - start_time,
-                    chunk_info={
-                        "url": request.url,
-                        "stream_type": request.stream_type,
-                        "start_time": request.start_time,
-                        "duration": request.duration,
-                        "skip_reason": "beyond_video_duration",
-                        "fast_mode": request.fast_mode,
-                        "provider": request.provider
-                    }
+                    start_time=request.start_time,
+                    end_time=request.start_time + request.duration,
+                    duration=request.duration
                 )
             else:
                 raise e
@@ -648,165 +848,353 @@ async def process_stream_segment(
         
         print(f"✅ Audio downloaded: {temp_audio_file} ({file_size} bytes)")
         
-        # Get STT and AI providers
-        stt_factory = STTProviderFactory()
-        ai_factory = AIProviderFactory()
-        stt_provider = None
-        ai_provider = None
+        # Transcribe audio
+        print("🎙️ Starting transcription...")
+        transcription_result = await stt_service.transcribe_file(
+            temp_audio_file,
+            AudioFormat.WAV,
+            language=request.language,
+            fast_mode=request.fast_mode
+        )
         
-        try:
-            logger.info(f"🏭 Creating STT provider: {request.provider}")
-            stt_provider = await stt_factory.create_provider(request.provider)
-            
-            # Create AI provider with fast mode if requested
-            ai_config = {"fast_mode": request.fast_mode} if request.fast_mode else {}
-            ai_provider = await ai_factory.create_provider("chatgpt", **ai_config)
-            logger.info(f"🤖 AI provider created with fast_mode: {request.fast_mode}")
-            
-        except ValueError as e:
-            logger.error(f"❌ Provider creation failed: {e}")
-            raise HTTPException(status_code=400, detail=str(e))
+        print(f"📝 Transcription: {transcription_result.text[:100]}...")
         
-        # Transcribe the downloaded audio
-        try:
-            logger.info(f"🎵 Starting transcription with {request.provider}")
+        # Fact-check transcription if there's content
+        if transcription_result.text.strip():
+            print("🔍 Starting fact-check...")
             
-            transcription_result = await stt_provider.transcribe_file(
-                temp_audio_file,
-                language=request.language,
-            )
-            
-            logger.info(f"✅ Transcription completed: {len(transcription_result.text)} characters")
-            
-            transcription_response = TranscriptionResponse(
+            try:
+                # Use the same approach as the working /fact-check/text endpoint
+                logger.info("Getting AI provider...")
+                ai_factory = AIProviderFactory()
+                ai_provider = ai_factory.get_provider("chatgpt")
+                if ai_provider is None:
+                    logger.info("AI provider not found, creating new one...")
+                    ai_provider = await ai_factory.create_provider("chatgpt")
+                logger.info("AI provider ready")
+                
+                # Get or create MCP provider for fact verification
+                logger.info("Getting MCP provider...")
+                mcp_provider = mcp_factory.get_provider("wikipedia")
+                if mcp_provider is None:
+                    logger.info("MCP provider not found, creating new one...")
+                    mcp_provider = await mcp_factory.create_provider("wikipedia")
+                logger.info("MCP provider ready")
+                
+                # Set language if specified
+                if request.language and request.language != "en":
+                    logger.info(f"Setting language to {request.language}")
+                    await mcp_provider.set_language(request.language)
+                
+                # Extract claims from text
+                logger.info("Extracting claims from text...")
+                claims = await ai_provider.analyze_text(transcription_result.text, None)
+                logger.info(f"Found {len(claims)} claims")
+                
+                # Verify each claim (same logic as working endpoint)
+                results = []
+                for i, claim in enumerate(claims):
+                    logger.info(f"Verifying claim {i+1}/{len(claims)}: {claim.text}")
+                    
+                    # Get AI verification
+                    logger.info("Getting AI verification...")
+                    ai_result = await ai_provider.verify_claim(claim, None)
+                    logger.info(f"AI verification complete: {ai_result.status}")
+                    
+                    # Get MCP validation
+                    logger.info("Getting MCP validation...")
+                    mcp_result = await mcp_provider.validate_fact(claim.text)
+                    logger.info(f"MCP validation complete: {mcp_result.is_valid}")
+                    
+                    # Combine results (prefer MCP when available)
+                    if mcp_result.is_valid:
+                        # Create new result with combined data
+                        combined_sources = ai_result.sources + mcp_result.source_urls
+                        final_result = VerificationResult(
+                            claim_text=ai_result.claim_text,
+                            status=ai_result.status,
+                            confidence=float_to_confidence_level(mcp_result.confidence),
+                            explanation=ai_result.explanation,
+                            sources=combined_sources,
+                            timestamp=ai_result.timestamp,
+                            metadata=ai_result.metadata
+                        )
+                        results.append(final_result)
+                    else:
+                        results.append(ai_result)
+                
+                # Convert to frontend format
+                claims_data = []
+                total_confidence = 0.0
+                status_counts = {
+                    'true': 0, 'false': 0, 'uncertain': 0, 'unverifiable': 0,
+                    'partially_true': 0, 'disputed': 0, 'misleading': 0
+                }
+                
+                for i, (claim, result) in enumerate(zip(claims, results)):
+                    # Convert VerificationStatus to string
+                    status_str = result.status.value.lower() if hasattr(result.status, 'value') else str(result.status).lower()
+                    if status_str == 'unverifiable':
+                        status_str = 'uncertain'
+                    
+                    # Convert ConfidenceLevel to percentage string
+                    confidence_str = result.confidence.value.lower() if hasattr(result.confidence, 'value') else str(result.confidence).lower()
+                    
+                    claims_data.append({
+                        'text': claim.text,
+                        'status': status_str,
+                        'confidence': confidence_str,
+                        'explanation': result.explanation or f"This claim was assessed as {status_str}"
+                    })
+                    
+                    # Count for overall status (handle all possible status types)
+                    if status_str in status_counts:
+                        status_counts[status_str] += 1
+                    else:
+                        # Handle any unknown status types as uncertain
+                        status_counts['uncertain'] += 1
+                    
+                    # Convert confidence to float for averaging
+                    confidence_float = 0.5  # default
+                    if confidence_str == 'high':
+                        confidence_float = 0.9
+                    elif confidence_str == 'medium':
+                        confidence_float = 0.7
+                    elif confidence_str == 'low':
+                        confidence_float = 0.5
+                    else:
+                        confidence_float = 0.3
+                    
+                    total_confidence += confidence_float
+                
+                # Calculate overall confidence and status
+                overall_confidence = total_confidence / len(claims) if len(claims) > 0 else 0.0
+                
+                # Determine overall status using weighted scoring system
+                total_claims = len(claims)
+                if total_claims == 0:
+                    overall_status = 'no_text'
+                else:
+                    # Calculate weighted scores for different status types
+                    positive_score = status_counts.get('true', 0) * 1.0 + status_counts.get('partially_true', 0) * 0.7
+                    negative_score = status_counts.get('false', 0) * 1.0 + status_counts.get('misleading', 0) * 0.8
+                    neutral_score = (
+                        status_counts.get('uncertain', 0) * 0.3 + 
+                        status_counts.get('unverifiable', 0) * 0.3 + 
+                        status_counts.get('disputed', 0) * 0.5
+                    )
+                    
+                    # Determine overall status based on weighted scores
+                    if positive_score > negative_score and positive_score > neutral_score:
+                        overall_status = 'true'
+                    elif negative_score > positive_score and negative_score > neutral_score:
+                        overall_status = 'false'
+                    elif total_claims == status_counts.get('uncertain', 0) + status_counts.get('unverifiable', 0):
+                        overall_status = 'not_checkable'
+                    else:
+                        overall_status = 'uncertain'
+                
+                fact_check_response = {
+                    'status': overall_status,
+                    'claims': claims_data,
+                    'overall_confidence': overall_confidence,
+                    'total_claims': len(claims),
+                    'processed_claims': len(claims)
+                }
+                
+                print(f"✅ Fact-check completed: {len(claims)} claims, {len(results)} results")
+                print(f"📊 Overall: {overall_status} ({overall_confidence:.1%} confidence)")
+                
+            except Exception as e:
+                logger.error(f"❌ Error in stream fact-checking: {type(e).__name__}: {str(e)}", exc_info=True)
+                # Fallback response on error
+                fact_check_response = {
+                    'status': 'error',
+                    'claims': [{
+                        'text': transcription_result.text[:100] + ('...' if len(transcription_result.text) > 100 else ''),
+                        'status': 'error',
+                        'confidence': 'insufficient',
+                        'explanation': f"Error occurred during fact-checking: {str(e)}"
+                    }],
+                    'overall_confidence': 0.0,
+                    'total_claims': 1,
+                    'processed_claims': 0,
+                    'error': str(e)
+                }
+                print(f"⚠️ Fact-check failed, using fallback response")
+        else:
+            # Empty transcription
+            fact_check_response = {
+                'status': 'no_text',
+                'claims': [],
+                'overall_confidence': 0.0,
+                'total_claims': 0,
+                'processed_claims': 0
+            }
+            print("⚠️ No transcribable content in this segment")
+        
+        processing_time = time.time() - start_time
+        
+        print(f"✅ Stream segment processed in {processing_time:.2f}s")
+        
+        return ChunkProcessingResponse(
+            chunk_index=0,  # Single segment
+            transcription=TranscriptionResponse(
                 text=transcription_result.text,
                 confidence=transcription_result.confidence,
                 language=transcription_result.language,
                 duration=transcription_result.end_time - transcription_result.start_time,
                 metadata=transcription_result.metadata,
-            )
-            
-            # Fact-check the transcription if there's text
-            fact_check_result = {"status": "no_text", "claims": [], "overall_confidence": 0.0}
-            
-            if transcription_result.text and len(transcription_result.text.strip()) > 10:
-                try:
-                    # Extract claims from transcription
-                    claims = await ai_provider.analyze_text(transcription_result.text)
-                    
-                    if claims:
-                        # Verify claims (simplified for fast processing)
-                        verified_claims = []
-                        total_confidence = 0.0
-                        
-                        for claim in claims[:3]:  # Limit to first 3 claims for speed
-                            verification = await ai_provider.verify_claim(claim)
-                            verified_claims.append({
-                                "text": claim.text,
-                                "status": verification.status.value if verification.status else "unknown",
-                                "confidence": verification.confidence.value if verification.confidence else "low",
-                                "explanation": verification.explanation
-                            })
-                            
-                            # Calculate confidence score
-                            confidence_map = {"high": 1.0, "medium": 0.6, "low": 0.3, "insufficient": 0.1}
-                            total_confidence += confidence_map.get(verification.confidence.value if verification.confidence else "low", 0.3)
-                        
-                        avg_confidence = total_confidence / len(verified_claims) if verified_claims else 0.0
-                        
-                        # Determine overall status
-                        statuses = [claim["status"] for claim in verified_claims]
-                        if any(status in ["false", "misleading"] for status in statuses):
-                            overall_status = "false"
-                        elif any(status == "disputed" for status in statuses):
-                            overall_status = "uncertain"
-                        elif any(status in ["true", "partially_true"] for status in statuses):
-                            overall_status = "true"
-                        else:
-                            overall_status = "not_checkable"
-                        
-                        fact_check_result = {
-                            "status": overall_status,
-                            "claims": verified_claims,
-                            "overall_confidence": avg_confidence,
-                            "total_claims": len(claims),
-                            "processed_claims": len(verified_claims)
-                        }
-                    else:
-                        fact_check_result = {"status": "not_checkable", "claims": [], "overall_confidence": 0.0}
-                        
-                except Exception as e:
-                    # Don't fail the entire request if fact-checking fails
-                    fact_check_result = {
-                        "status": "error", 
-                        "error": str(e),
-                        "claims": [], 
-                        "overall_confidence": 0.0
-                    }
-            
-            processing_time = time.time() - start_time
-            
-            print(f"✅ Stream segment processed in {processing_time:.2f}s")
-            
-            return ChunkProcessingResponse(
-                transcription=transcription_response,
-                fact_check=fact_check_result,
-                processing_time=processing_time,
-                chunk_info={
-                    "url": request.url,
-                    "stream_type": request.stream_type,
-                    "start_time": request.start_time,
-                    "duration": request.duration,
-                    "fast_mode": request.fast_mode,
-                    "provider": request.provider
-                }
-            )
-            
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-        finally:
-            # Clean up providers
-            if stt_provider:
-                await stt_factory.shutdown_provider(request.provider)
-            if ai_provider:
-                await ai_factory.shutdown()
-    
+            ),
+            fact_check=fact_check_response,
+            processing_time=processing_time,
+            start_time=request.start_time,
+            end_time=request.start_time + request.duration,
+            duration=request.duration
+        )
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stream processing failed: {str(e)}")
-    
+        logger.error(f"Stream processing error: {e}")
+        
+        # Special handling for duration-related errors
+        if "beyond video duration" in str(e):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Segment beyond video duration: {str(e)}"
+            )
+        
+        raise HTTPException(status_code=500, detail=str(e))
+
     finally:
-        # Clean up temp file
+        # Clean up temporary audio file
         if temp_audio_file and os.path.exists(temp_audio_file):
-            os.unlink(temp_audio_file) 
+            os.unlink(temp_audio_file)
+
+
+@router.post("/check-live-status", response_model=LiveStatusResponse)
+async def check_live_status(
+    request: LiveStatusRequest,
+    stream_analysis_service: StreamAnalysisService = Depends(get_stream_analysis_service)
+) -> LiveStatusResponse:
+    """Check if a stream URL is currently live using authoritative APIs.
+    
+    This endpoint provides the most reliable way to detect live streams
+    by using official APIs (YouTube Data API, etc.) rather than URL parsing.
+    """
+    try:
+        # Use domain service for stream analysis
+        stream_info = await stream_analysis_service.analyze_stream(
+            url=request.url,
+            stream_type=request.stream_type,
+            manual_live_override=request.manual_live_override
+        )
+        
+        # Convert domain model to API response
+        return LiveStatusResponse(
+            is_live=stream_info.is_live,
+            live_broadcast_content=stream_info.broadcast_status.value,
+            method=stream_info.detection_method.value,
+            video_id=stream_info.video_id,
+            title=stream_info.title,
+            concurrent_viewers=stream_info.concurrent_viewers,
+            error=stream_info.error_message
+        )
+            
+    except Exception as e:
+        logger.error(f"Live status check error: {e}")
+        return LiveStatusResponse(
+            is_live=False,
+            live_broadcast_content='none',
+            method='error_fallback',
+            video_id=None,
+            error=str(e)
+        )
 
 
 @router.post("/video-info")
 async def get_video_info(
     request: StreamProcessingRequest,
+    stream_analysis_service: StreamAnalysisService = Depends(get_stream_analysis_service)
 ):
-    """Get video information including duration.
-    
+    """Get video information including duration and live status.
+
     Args:
         request: Stream processing request with URL and stream type
         
     Returns:
-        Video information including duration
+        Video information including duration, live status, and metadata
     """
     try:
+        # Get live status using domain service first
+        stream_info = await stream_analysis_service.analyze_stream(
+            url=request.url,
+            stream_type=request.stream_type
+        )
+        
+        # Get duration
         duration = await get_video_duration(request.url, request.stream_type)
         
-        # Calculate optimal number of segments
-        chunk_duration = request.duration
-        total_segments = max(1, int((duration + chunk_duration - 1) // chunk_duration))
+        # If stream analysis says it's live OR duration detection says it's live
+        is_live_stream = (
+            stream_analysis_service.is_live_processing_recommended(stream_info) or
+            duration == -1.0
+        )
         
-        return {
-            "duration": duration,
-            "duration_formatted": f"{duration/60:.1f} minutes",
-            "chunk_duration": chunk_duration,
-            "total_segments": total_segments,
-            "stream_type": request.stream_type,
-            "url": request.url
-        }
+        if is_live_stream:
+            logger.info(f"🔴 Live stream confirmed - using live processing mode")
+            duration = -1.0  # Ensure duration is set to live indicator
+            chunk_duration = stream_analysis_service.get_recommended_chunk_duration(stream_info)
+            
+            response = {
+                "duration": -1,  # Special value for live streams
+                "duration_formatted": "Live Stream",
+                "chunk_duration": chunk_duration,
+                "total_segments": -1,  # Infinite segments for live
+                "stream_type": request.stream_type,
+                "url": request.url,
+                "is_live": True,
+                "live_status": {
+                    "is_live": stream_info.is_live,
+                    "live_broadcast_content": stream_info.broadcast_status.value,
+                    "method": stream_info.detection_method.value,
+                    "title": stream_info.title,
+                    "concurrent_viewers": stream_info.concurrent_viewers,
+                    "error": stream_info.error_message
+                },
+                "note": "Live stream detected - use real-time processing mode",
+                "recommended_chunk_duration": chunk_duration,
+                "processing_mode": "live"
+            }
+            
+        else:
+            # Regular video processing
+            if duration <= 0:
+                duration = 3600.0  # Fallback for regular videos
+            
+            chunk_duration = request.duration
+            total_segments = max(1, int((duration + chunk_duration - 1) // chunk_duration))
+            
+            response = {
+                "duration": duration,
+                "duration_formatted": f"{duration/60:.1f} minutes",
+                "chunk_duration": chunk_duration,
+                "total_segments": total_segments,
+                "stream_type": request.stream_type,
+                "url": request.url,
+                "is_live": False,
+                "live_status": {
+                    "is_live": stream_info.is_live,
+                    "live_broadcast_content": stream_info.broadcast_status.value,
+                    "method": stream_info.detection_method.value,
+                    "title": stream_info.title,
+                    "concurrent_viewers": stream_info.concurrent_viewers,
+                    "error": stream_info.error_message
+                },
+                "processing_mode": "regular"
+            }
+        
+        logger.info(f"📊 Video info response: duration={response['duration']}, is_live={response['is_live']}, mode={response['processing_mode']}")
+        return response
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get video info: {str(e)}") 
