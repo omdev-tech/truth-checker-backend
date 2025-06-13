@@ -40,4 +40,23 @@ class FactCheckResult:
             
         if self.evidence is None:
             # Convert sources to simple evidence list
-            self.evidence = [source.get('title', 'Unknown source') for source in self.sources] 
+            self.evidence = []
+            for source in self.sources:
+                if isinstance(source, dict):
+                    self.evidence.append(source.get('title', source.get('url', 'Unknown source')))
+                else:
+                    # Handle string sources
+                    self.evidence.append(str(source))
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert FactCheckResult to dictionary format for API responses."""
+        return {
+            'overall_assessment': self.overall_assessment,
+            'claims': self.claims,
+            'sources': self.sources,
+            'confidence_score': self.confidence_score,
+            'is_valid': self.is_valid,
+            'confidence': self.confidence,
+            'explanation': self.explanation,
+            'evidence': self.evidence
+        } 

@@ -26,10 +26,12 @@ from ...domain.ports.stt_provider import TranscriptionResult, AudioFormat, Video
 from ...domain.services.fact_checking_service import FactCheckingService
 from ...domain.services.stt_service import STTService
 from ...domain.services.stream_analysis_service import StreamAnalysisService
+from ...domain.services.youtube_auth_service import YouTubeAuthService
 from ...infrastructure.dependencies import (
     get_fact_checking_service,
     get_stt_service,
-    get_stream_analysis_service
+    get_stream_analysis_service,
+    get_youtube_auth_service
 )
 from ...infrastructure.ai.factory import AIProviderFactory
 from ...infrastructure.mcp.factory import MCPProviderFactory, mcp_factory
@@ -50,6 +52,62 @@ def float_to_confidence_level(confidence: float) -> ConfidenceLevel:
         return ConfidenceLevel.LOW
     else:
         return ConfidenceLevel.INSUFFICIENT
+
+
+def convert_fact_check_to_frontend_format(fact_check_result) -> dict:
+    """Convert FactCheckResult to frontend expected format."""
+    if hasattr(fact_check_result, 'to_dict'):
+        result_dict = fact_check_result.to_dict()
+    else:
+        result_dict = fact_check_result
+    
+    # Convert claims to frontend format
+    frontend_claims = []
+    if 'claims' in result_dict and result_dict['claims']:
+        for claim in result_dict['claims']:
+            if isinstance(claim, dict):
+                # Convert confidence number to string
+                claim_confidence = claim.get('confidence', 0.5)
+                if isinstance(claim_confidence, (int, float)):
+                    if claim_confidence >= 0.9:
+                        conf_str = 'high'
+                    elif claim_confidence >= 0.7:
+                        conf_str = 'medium'
+                    elif claim_confidence >= 0.5:
+                        conf_str = 'low'
+                    else:
+                        conf_str = 'insufficient'
+                else:
+                    conf_str = str(claim_confidence).lower()
+                
+                frontend_claims.append({
+                    'text': claim.get('claim', claim.get('text', 'Unknown claim')),
+                    'status': claim.get('status', 'uncertain'),
+                    'confidence': conf_str,
+                    'explanation': claim.get('explanation', 'No explanation available')
+                })
+    
+    # Determine overall status based on claims
+    overall_status = 'no_text'
+    if frontend_claims:
+        verified_count = sum(1 for claim in frontend_claims if claim['status'] in ['verified', 'true'])
+        total_claims = len(frontend_claims)
+        
+        if verified_count == total_claims:
+            overall_status = 'true'
+        elif verified_count == 0:
+            overall_status = 'disputed'
+        else:
+            overall_status = 'partially_true'
+    
+    return {
+        'status': overall_status,
+        'claims': frontend_claims,
+        'overall_confidence': result_dict.get('confidence_score', 0.0),
+        'total_claims': len(frontend_claims),
+        'processed_claims': len(frontend_claims),
+        'error': None if frontend_claims else 'No claims extracted'
+    }
 
 
 class HealthStatus(BaseModel):
@@ -161,15 +219,16 @@ async def health_check(
     )
 
 
-@router.post("/transcribe")
+@router.post("/transcribe", response_model=ChunkProcessingResponse)
 async def transcribe_file(
     file: UploadFile = File(...),
     provider: str = Form("elevenlabs"),
     language: Optional[str] = Form(None),
     fast_mode: bool = Form(True),
-    stt_service: STTService = Depends(get_stt_service)
+    stt_service: STTService = Depends(get_stt_service),
+    fact_checker: FactCheckingService = Depends(get_fact_checking_service)
 ):
-    """Transcribe uploaded audio/video file."""
+    """Transcribe uploaded audio/video file and perform fact-checking."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file uploaded")
     
@@ -178,6 +237,9 @@ async def transcribe_file(
     try:
         import tempfile
         import os
+        import time
+        
+        start_time = time.time()  # Start timing
         
         # Create temporary file with appropriate extension
         file_ext = os.path.splitext(file.filename)[1] if file.filename else '.tmp'
@@ -192,6 +254,8 @@ async def transcribe_file(
         else:
             format_type = AudioFormat.WAV  # Default audio format
         
+        logger.info(f"🎙️ Starting transcription for file: {file.filename}")
+        
         # Process file
         result = await stt_service.transcribe_file(
             temp_file,
@@ -200,13 +264,43 @@ async def transcribe_file(
             fast_mode=fast_mode
         )
         
-        return {
-            "transcription": result.text,
-            "confidence": result.confidence,
-            "processing_time": result.processing_time,
-            "language": result.language,
-            "provider": provider
-        }
+        logger.info(f"📝 Transcription completed: {len(result.text)} characters")
+        
+        # Fact-check transcription if there's content
+        if result.text.strip():
+            logger.info("🔍 Starting fact-check process...")
+            fact_check_result = await fact_checker.fact_check(result.text)
+            logger.info(f"✅ Fact-check completed: {fact_check_result.overall_assessment}")
+            fact_check_dict = convert_fact_check_to_frontend_format(fact_check_result)
+        else:
+            # Empty transcription - create empty fact-check result
+            fact_check_dict = {
+                'status': 'no_text',
+                'claims': [],
+                'overall_confidence': 0.0,
+                'total_claims': 0,
+                'processed_claims': 0,
+                'error': 'No content to fact-check'
+            }
+            logger.info("⚠️ No transcribable content found")
+        
+        processing_time = time.time() - start_time  # Calculate processing time
+        
+        return ChunkProcessingResponse(
+            chunk_index=0,  # Single file, so index 0
+            transcription=TranscriptionResponse(
+                text=result.text,
+                confidence=result.confidence,
+                language=result.language,
+                duration=result.end_time - result.start_time,
+                metadata=result.metadata,
+            ),
+            fact_check=fact_check_dict,
+            processing_time=processing_time,
+            start_time=0.0,
+            end_time=result.end_time - result.start_time,
+            duration=result.end_time - result.start_time
+        )
         
     except Exception as e:
         logger.error(f"Transcription error: {e}")
@@ -265,14 +359,17 @@ async def process_chunk(
         if transcription_result.text.strip():
             fact_check_result = await fact_checker.fact_check(transcription_result.text)
             print(f"✅ Fact-check completed: {fact_check_result.overall_assessment}")
+            fact_check_dict = convert_fact_check_to_frontend_format(fact_check_result)
         else:
             # Empty transcription
-            fact_check_result = type('obj', (object,), {
-                'overall_assessment': 'No content to fact-check',
+            fact_check_dict = {
+                'status': 'no_text',
                 'claims': [],
-                'sources': [],
-                'confidence_score': 0.0
-            })()
+                'overall_confidence': 0.0,
+                'total_claims': 0,
+                'processed_claims': 0,
+                'error': 'No content to fact-check'
+            }
             print("⚠️ No transcribable content in this chunk")
         
         processing_time = time.time() - start_time
@@ -286,7 +383,7 @@ async def process_chunk(
                 duration=transcription_result.end_time - transcription_result.start_time,
                 metadata=transcription_result.metadata,
             ),
-            fact_check=fact_check_result,
+            fact_check=fact_check_dict,
             processing_time=processing_time,
             start_time=request.start_time,
             end_time=request.end_time,
@@ -581,12 +678,13 @@ def extract_twitch_channel(url: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-async def get_video_duration(url: str, stream_type: str) -> float:
-    """Get the actual duration of a video using yt-dlp.
+async def get_video_duration(url: str, stream_type: str, youtube_auth_service: YouTubeAuthService) -> float:
+    """Get the actual duration of a video using yt-dlp with proper authentication.
 
     Args:
         url: Video URL
         stream_type: Type of stream ('youtube', 'twitch', 'direct-url')
+        youtube_auth_service: YouTube authentication service
 
     Returns:
         Duration in seconds (returns -1 for live streams)
@@ -597,14 +695,19 @@ async def get_video_duration(url: str, stream_type: str) -> float:
             if not video_id:
                 raise ValueError("Invalid YouTube URL")
             
-            # Use yt-dlp to get video information
-            cmd = [
-                'yt-dlp',
-                '--quiet',
-                '--no-warnings',
+            # Ensure we have valid YouTube authentication
+            auth_result = await youtube_auth_service.ensure_valid_authentication()
+            if not auth_result.success:
+                logger.warning(f"⚠️ YouTube authentication failed: {auth_result.error_message}")
+                logger.info("🔄 Proceeding without authentication - may have limited access")
+            
+            # Use yt-dlp with authentication to get video information
+            cmd = ['yt-dlp', '--quiet', '--no-warnings'] + youtube_auth_service.get_yt_dlp_args() + [
                 '--print', 'duration',
                 f'https://www.youtube.com/watch?v={video_id}'
             ]
+            
+            logger.debug(f"🎬 Running yt-dlp duration check: {' '.join(cmd)}")
             
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -614,7 +717,16 @@ async def get_video_duration(url: str, stream_type: str) -> float:
             stdout, stderr = await process.communicate()
             
             if process.returncode != 0:
-                logger.warning(f"⚠️ Could not get video duration: {stderr.decode()}")
+                error_msg = stderr.decode()
+                logger.warning(f"⚠️ Could not get video duration: {error_msg}")
+                
+                # Check if it's a bot detection error
+                if "Sign in to confirm you're not a bot" in error_msg:
+                    logger.error("🤖 YouTube bot detection triggered - authentication service may need refresh")
+                    # Try to refresh authentication
+                    await youtube_auth_service.authenticate()
+                    raise RuntimeError(f"YouTube authentication required: {error_msg}")
+                
                 return 3600.0  # Default to 1 hour if unknown
             
             duration_str = stdout.decode().strip()
@@ -645,15 +757,17 @@ async def download_stream_audio(
     url: str, 
     stream_type: str, 
     start_time: float = 0.0, 
-    duration: float = 300.0
+    duration: float = 300.0,
+    youtube_auth_service: YouTubeAuthService = None
 ) -> str:
-    """Download audio from stream URL using yt-dlp and ffmpeg.
+    """Download audio from stream URL using yt-dlp with proper authentication.
 
     Args:
         url: Stream URL
         stream_type: Type of stream ('youtube', 'twitch', 'direct-url')
         start_time: Start time in seconds
         duration: Duration in seconds
+        youtube_auth_service: YouTube authentication service
 
     Returns:
         Path to downloaded audio file
@@ -671,7 +785,7 @@ async def download_stream_audio(
                 raise ValueError("Invalid YouTube URL")
             
             # Get actual video duration first
-            video_duration = await get_video_duration(url, stream_type)
+            video_duration = await get_video_duration(url, stream_type, youtube_auth_service)
             
             # Only check duration limits for non-live streams (video_duration > 0)
             if video_duration > 0:
@@ -690,15 +804,25 @@ async def download_stream_audio(
                 logger.info(f"🔴 Live stream detected - skipping duration validation")
                 logger.info(f"🎵 Processing live audio: {duration}s from current position")
             
-            # Use yt-dlp to extract audio stream URL
-            cmd = [
-                'yt-dlp',
-                '--quiet',
-                '--no-warnings',
+            # Ensure we have valid YouTube authentication
+            if youtube_auth_service:
+                auth_result = await youtube_auth_service.ensure_valid_authentication()
+                if not auth_result.success:
+                    logger.warning(f"⚠️ YouTube authentication failed: {auth_result.error_message}")
+                    logger.info("🔄 Proceeding without authentication - may have limited access")
+                yt_dlp_auth_args = youtube_auth_service.get_yt_dlp_args()
+            else:
+                logger.warning("⚠️ No YouTube authentication service provided - using legacy config")
+                yt_dlp_auth_args = []
+            
+            # Use yt-dlp with authentication to extract audio stream URL
+            cmd = ['yt-dlp', '--quiet', '--no-warnings'] + yt_dlp_auth_args + [
                 '--get-url',
                 '--format', 'bestaudio/best',
                 f'https://www.youtube.com/watch?v={video_id}'
             ]
+            
+            logger.debug(f"🎵 Running yt-dlp for audio extraction: {' '.join(cmd)}")
             
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -709,9 +833,27 @@ async def download_stream_audio(
                 stdout, stderr = await process.communicate()
                 
                 if process.returncode != 0:
-                    raise RuntimeError(f"yt-dlp failed: {stderr.decode()}")
+                    error_msg = stderr.decode()
+                    logger.error(f"💥 yt-dlp failed: {error_msg}")
+                    
+                    # Provide specific guidance for bot detection
+                    if "Sign in to confirm you're not a bot" in error_msg:
+                        logger.error("🤖 YouTube bot detection triggered")
+                        if youtube_auth_service:
+                            logger.info("🔄 Attempting to refresh authentication...")
+                            auth_result = await youtube_auth_service.authenticate()
+                            if auth_result.success:
+                                logger.info("✅ Authentication refreshed, please retry")
+                            else:
+                                logger.error("❌ Authentication refresh failed")
+                        logger.error("🔧 To fix this, configure cookies in your .env file:")
+                        logger.error("   YT_DLP_COOKIES_FROM_BROWSER=firefox")
+                        logger.error("   (or chrome, safari, etc.)")
+                        
+                    raise RuntimeError(f"yt-dlp failed: {error_msg}")
                 
                 audio_url = stdout.decode().strip()
+                logger.info(f"✅ Audio stream URL extracted successfully")
                 
             except FileNotFoundError:
                 raise RuntimeError("yt-dlp not found. Please install yt-dlp: pip install yt-dlp")
@@ -786,12 +928,15 @@ async def download_stream_audio(
 @router.post("/process-stream", response_model=ChunkProcessingResponse)
 async def process_stream_segment(
     request: StreamProcessingRequest,
-    stt_service: STTService = Depends(get_stt_service)
+    stt_service: STTService = Depends(get_stt_service),
+    youtube_auth_service: YouTubeAuthService = Depends(get_youtube_auth_service)
 ) -> ChunkProcessingResponse:
     """Process a segment from a stream URL (YouTube, Twitch, etc.).
 
     Args:
         request: Stream processing request with URL and parameters
+        stt_service: Speech-to-text service
+        youtube_auth_service: YouTube authentication service
         
     Returns:
         Combined transcription and fact-check results
@@ -816,7 +961,8 @@ async def process_stream_segment(
                 request.url,
                 request.stream_type,
                 request.start_time,
-                request.duration
+                request.duration,
+                youtube_auth_service
             )
         except ValueError as e:
             # Handle segments beyond video duration gracefully
@@ -1113,12 +1259,15 @@ async def check_live_status(
 @router.post("/video-info")
 async def get_video_info(
     request: StreamProcessingRequest,
-    stream_analysis_service: StreamAnalysisService = Depends(get_stream_analysis_service)
+    stream_analysis_service: StreamAnalysisService = Depends(get_stream_analysis_service),
+    youtube_auth_service: YouTubeAuthService = Depends(get_youtube_auth_service)
 ):
     """Get video information including duration and live status.
 
     Args:
         request: Stream processing request with URL and stream type
+        stream_analysis_service: Stream analysis service
+        youtube_auth_service: YouTube authentication service
         
     Returns:
         Video information including duration, live status, and metadata
@@ -1130,8 +1279,8 @@ async def get_video_info(
             stream_type=request.stream_type
         )
         
-        # Get duration
-        duration = await get_video_duration(request.url, request.stream_type)
+        # Get duration with authentication
+        duration = await get_video_duration(request.url, request.stream_type, youtube_auth_service)
         
         # If stream analysis says it's live OR duration detection says it's live
         is_live_stream = (
@@ -1162,7 +1311,12 @@ async def get_video_info(
                 },
                 "note": "Live stream detected - use real-time processing mode",
                 "recommended_chunk_duration": chunk_duration,
-                "processing_mode": "live"
+                "processing_mode": "live",
+                "authentication_status": {
+                    "is_authenticated": youtube_auth_service.is_authenticated,
+                    "method": youtube_auth_service.current_method.value if youtube_auth_service.current_method else None,
+                    "provider": youtube_auth_service.provider_name
+                }
             }
             
         else:
@@ -1189,11 +1343,56 @@ async def get_video_info(
                     "concurrent_viewers": stream_info.concurrent_viewers,
                     "error": stream_info.error_message
                 },
-                "processing_mode": "regular"
+                "processing_mode": "regular",
+                "authentication_status": {
+                    "is_authenticated": youtube_auth_service.is_authenticated,
+                    "method": youtube_auth_service.current_method.value if youtube_auth_service.current_method else None,
+                    "provider": youtube_auth_service.provider_name
+                }
             }
         
         logger.info(f"📊 Video info response: duration={response['duration']}, is_live={response['is_live']}, mode={response['processing_mode']}")
         return response
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get video info: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Failed to get video info: {str(e)}")
+
+
+@router.get("/youtube-auth-status")
+async def youtube_auth_status(
+    youtube_auth_service: YouTubeAuthService = Depends(get_youtube_auth_service)
+):
+    """Check YouTube authentication status for monitoring."""
+    try:
+        # Test current authentication
+        is_working = await youtube_auth_service.test_authentication()
+        
+        # Get available methods
+        available_methods = youtube_auth_service.get_available_auth_methods()
+        
+        # If not working, try to authenticate
+        if not is_working:
+            auth_result = await youtube_auth_service.authenticate()
+            is_working = auth_result.success
+        
+        return {
+            "status": "healthy" if is_working else "degraded",
+            "authenticated": is_working,
+            "current_method": youtube_auth_service.current_method.value if youtube_auth_service.current_method else None,
+            "available_methods": [method.value for method in available_methods],
+            "provider": youtube_auth_service.provider_name,
+            "timestamp": datetime.now().isoformat(),
+            "details": {
+                "can_access_youtube": is_working,
+                "fallback_methods_available": len(available_methods) > 1
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"YouTube auth status check failed: {e}")
+        return {
+            "status": "error",
+            "authenticated": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        } 
